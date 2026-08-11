@@ -89,6 +89,12 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	usb_source_remove(sdi->session, drvc->sr_ctx);
 	std_session_send_df_end(sdi);
 
+	if (devc->stl) {
+		soft_trigger_logic_free(devc->stl);
+		devc->stl = NULL;
+	}
+	devc->trigger_fired = TRUE;
+
 	if (devc->expand_buf) {
 		g_free(devc->expand_buf);
 		devc->expand_buf = NULL;
@@ -102,12 +108,15 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	uint8_t *ptr;
+	uint8_t *free_ptr;
 	uint8_t mask;
 	size_t len;
 	size_t step;
 	size_t expanded_len;
 	size_t bytes_to_transfer;
 	size_t i, j;
+	int trigger_offset;
+	int pre_trigger_samples;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -171,6 +180,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		devc->bytes_transferring = 0;
 
 	if (transfer->actual_length > 0) {
+		free_ptr = NULL;
 		ptr = transfer->buffer;
 		len = transfer->actual_length;
 
@@ -197,6 +207,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 				sr_warn("expand_buf too small or NULL, "
 					"falling back to g_malloc");
 				ptr = g_malloc(expanded_len);
+				free_ptr = ptr;
 				if (!ptr) {
 					sr_err("Failed to allocate expansion "
 					       "buffer");
@@ -218,13 +229,57 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			len = expanded_len;
 		}
 
-		submit_data(ptr, len, sdi);
+		/*
+		 * Software trigger handling.  Before the trigger fires, all
+		 * data is consumed by the soft-trigger logic, which keeps a
+		 * pre-trigger ring buffer and itself sends the pre-trigger
+		 * data plus SR_DF_TRIGGER once the pattern matches.  After it
+		 * fires, deliver the remaining data up to the sample budget.
+		 */
+		if (devc->stl) {
+			if (!devc->trigger_fired) {
+				trigger_offset = soft_trigger_logic_check(
+					devc->stl, ptr, (int)len,
+					&pre_trigger_samples);
+				if (trigger_offset >= 0) {
+					devc->samples_sent =
+						(uint64_t)pre_trigger_samples;
+					ptr += trigger_offset;
+					len -= (size_t)trigger_offset;
+					if (devc->samples_need > 0 &&
+					    len > devc->samples_need -
+							    devc->samples_sent)
+						len = devc->samples_need -
+						      devc->samples_sent;
+					if (len > 0) {
+						submit_data(ptr, len, sdi);
+						devc->samples_sent += len;
+					}
+					devc->trigger_fired = TRUE;
+				}
+			} else {
+				if (devc->samples_need > 0 &&
+				    len > devc->samples_need -
+						    devc->samples_sent)
+					len = devc->samples_need -
+					      devc->samples_sent;
+				if (len > 0) {
+					submit_data(ptr, len, sdi);
+					devc->samples_sent += len;
+				}
+			}
+		} else {
+			submit_data(ptr, len, sdi);
+		}
 
-		/* Free fallback allocation if we couldn't use expand_buf. */
-		if (devc->cur_samplechannel != 8 &&
-		    devc->cur_samplechannel > 0 && ptr != devc->expand_buf)
-			g_free(ptr);
+		if (free_ptr)
+			g_free(free_ptr);
 	}
+
+	/* In triggered captures, stop once the sample budget is met. */
+	if (devc->stl && devc->trigger_fired && devc->samples_need > 0 &&
+	    devc->samples_sent >= devc->samples_need)
+		sipeed_slogic_combo8_acquisition_stop(sdi);
 
 	/* Determine how many bytes to request in the next submission. */
 	bytes_to_transfer = 0;
@@ -393,10 +448,31 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	usb_source_add(sdi->session, drvc->sr_ctx, 10, handle_events,
 		       (void *)sdi);
 
+	/* Compute the total number of samples to deliver this capture. */
+	devc->samples_need = devc->limit_samples;
+	if (devc->limit_msec > 0) {
+		devc->samples_need =
+			devc->limit_msec * devc->cur_samplerate / 1000;
+		sr_info("Capture limited to %" PRIu64 " samples "
+			"(%" PRIu64 " ms)",
+			devc->samples_need, devc->limit_msec);
+	}
+	devc->samples_sent = 0;
+
+	/*
+	 * Software trigger: while armed we can't predict when it will fire,
+	 * so the bulk pipeline runs continuously and the sample budget stops
+	 * it once the post-trigger data has been delivered.
+	 */
+	devc->stl = NULL;
+	devc->trigger_fired = TRUE;
+	if (sr_session_trigger_get(sdi->session))
+		devc->trigger_fired = FALSE;
+
 	/* Compute total bytes to transfer from the sample limit. */
-	if (devc->limit_samples > 0) {
+	if (devc->trigger_fired && devc->samples_need > 0) {
 		samples_in_bytes =
-			devc->limit_samples * devc->cur_samplechannel / 8;
+			devc->samples_need * devc->cur_samplechannel / 8;
 		devc->bytes_need_transfer =
 			samples_in_bytes / devc->transfers_buffer_size;
 		devc->bytes_need_transfer +=
@@ -478,6 +554,54 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	std_session_send_df_header(sdi);
 
 	/*
+	 * Report the actual samplerate through a META packet.  Frontends
+	 * (e.g. PulseView) use this to re-synchronise their channel layout
+	 * after the capture mode has changed, so this must be sent on every
+	 * acquisition, regardless of whether the rate changed.
+	 */
+	struct sr_datafeed_meta meta;
+	struct sr_config *src;
+	struct sr_datafeed_packet packet;
+
+	src = sr_config_new(SR_CONF_SAMPLERATE,
+			    g_variant_new_uint64(devc->cur_samplerate));
+	meta.config = g_slist_append(NULL, src);
+
+	packet.type = SR_DF_META;
+	packet.payload = &meta;
+	sr_session_send(sdi, &packet);
+
+	g_slist_free(meta.config);
+	sr_config_free(src);
+
+	/*
+	 * Set up the software trigger.  Done here, after the transfers are
+	 * already submitted but before CMD_START, so no receive callback can
+	 * race ahead of the trigger state.
+	 */
+	if (!devc->trigger_fired) {
+		struct sr_trigger *trigger;
+		int pre_trigger_samples;
+
+		trigger = sr_session_trigger_get(sdi->session);
+		pre_trigger_samples = 0;
+		if (devc->samples_need > 0)
+			pre_trigger_samples =
+				(devc->capture_ratio * devc->samples_need) /
+				100;
+		devc->stl = soft_trigger_logic_new(sdi, trigger,
+						   pre_trigger_samples);
+		if (!devc->stl) {
+			sr_err("Failed to allocate software trigger logic");
+			sipeed_slogic_combo8_acquisition_stop(
+				(struct sr_dev_inst *)sdi);
+			return SR_ERR_MALLOC;
+		}
+		sr_info("Software trigger armed, %d pre-trigger samples",
+			pre_trigger_samples);
+	}
+
+	/*
 	 * Send the start command as a 4-byte control write: 16-bit sample
 	 * rate (little-endian), channel count, and one padding byte.  The
 	 * firmware expects a 4-byte-aligned payload; 500 ms is the timeout
@@ -495,6 +619,10 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	if (ret < 0) {
 		sr_err("Unable to send start command: %s",
 		       libusb_error_name(ret));
+		if (devc->stl) {
+			soft_trigger_logic_free(devc->stl);
+			devc->stl = NULL;
+		}
 		sipeed_slogic_combo8_acquisition_stop(
 			(struct sr_dev_inst *)sdi);
 		return SR_ERR_IO;
@@ -516,6 +644,10 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 			sr_err("Failed to allocate bit-expansion buffer "
 			       "(%zu bytes)",
 			       devc->expand_buf_size);
+			if (devc->stl) {
+				soft_trigger_logic_free(devc->stl);
+				devc->stl = NULL;
+			}
 			sipeed_slogic_combo8_acquisition_stop(
 				(struct sr_dev_inst *)sdi);
 			return SR_ERR_MALLOC;
