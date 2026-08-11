@@ -89,11 +89,135 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	usb_source_remove(sdi->session, drvc->sr_ctx);
 	std_session_send_df_end(sdi);
 
+	if (devc->stl) {
+		soft_trigger_logic_free(devc->stl);
+		devc->stl = NULL;
+	}
+	devc->trigger_fired = TRUE;
+
 	if (devc->expand_buf) {
 		g_free(devc->expand_buf);
 		devc->expand_buf = NULL;
 		devc->expand_buf_size = 0;
 	}
+}
+
+static void pre_trigger_append_local(struct soft_trigger_logic *stl,
+				     const uint8_t *buf, int len)
+{
+	if (!stl || stl->pre_trigger_size <= 0)
+		return;
+
+	if (len > stl->pre_trigger_size) {
+		buf += len - stl->pre_trigger_size;
+		len = stl->pre_trigger_size;
+	}
+
+	stl->pre_trigger_fill =
+		MIN(stl->pre_trigger_fill + len, stl->pre_trigger_size);
+
+	while (len > 0) {
+		size_t size = MIN((size_t)(stl->pre_trigger_buffer +
+					   stl->pre_trigger_size -
+					   stl->pre_trigger_head),
+				  (size_t)len);
+		memcpy(stl->pre_trigger_head, buf, size);
+		stl->pre_trigger_head += size;
+		if (stl->pre_trigger_head >=
+		    stl->pre_trigger_buffer + stl->pre_trigger_size)
+			stl->pre_trigger_head = stl->pre_trigger_buffer;
+		buf += size;
+		len -= size;
+	}
+}
+
+/*
+ * Check if the current raw USB transfer cannot possibly match the trigger.
+ * Fast-paths the common single-stage, single-channel trigger case by scanning
+ * the packed data in 64-bit words without unpacking.
+ */
+static gboolean trigger_cannot_match(struct dev_context *devc,
+				     const uint8_t *raw_buf, size_t raw_len)
+{
+	struct sr_trigger_stage *stage;
+	struct sr_trigger_match *match;
+	uint64_t mask64, expected64;
+	const uint64_t *w;
+	size_t n_words, k, i;
+	int ch, prev_bit, match_type;
+	uint8_t mask, expected_pattern;
+
+	if (!devc->stl || !devc->stl->trigger || !devc->stl->trigger->stages)
+		return FALSE;
+
+	/* Only handle single-stage, single-match triggers. */
+	if (devc->stl->trigger->stages->next)
+		return FALSE;
+
+	stage = devc->stl->trigger->stages->data;
+	if (!stage || !stage->matches || stage->matches->next)
+		return FALSE;
+
+	match = stage->matches->data;
+	if (!match || !match->channel || !match->channel->enabled)
+		return FALSE;
+
+	ch = match->channel->index;
+	if (ch >= (int)devc->cur_samplechannel)
+		return TRUE; /* Channel is disabled in this mode, cannot match. */
+
+	if (devc->cur_samplechannel == 2) {
+		mask = (ch == 0) ? 0x55 : 0xaa;
+	} else if (devc->cur_samplechannel == 4) {
+		mask = (1 << ch) | (1 << (ch + 4));
+	} else if (devc->cur_samplechannel == 8) {
+		mask = (1 << ch);
+	} else {
+		return FALSE;
+	}
+
+	prev_bit = (*devc->stl->prev_sample >> ch) & 1;
+	match_type = match->match;
+
+	if (match_type == SR_TRIGGER_FALLING) {
+		if (devc->stl->count == 0 || prev_bit == 1)
+			expected_pattern = mask; /* All 1s -> no 0 to fall to */
+		else
+			expected_pattern = 0; /* All 0s -> no 1 to fall from */
+	} else if (match_type == SR_TRIGGER_RISING) {
+		if (devc->stl->count == 0 || prev_bit == 0)
+			expected_pattern = 0; /* All 0s -> no 1 to rise to */
+		else
+			expected_pattern =
+				mask; /* All 1s -> no 0 to rise from */
+	} else if (match_type == SR_TRIGGER_ZERO) {
+		expected_pattern = mask; /* All 1s -> no 0 */
+	} else if (match_type == SR_TRIGGER_ONE) {
+		expected_pattern = 0; /* All 0s -> no 1 */
+	} else if (match_type == SR_TRIGGER_EDGE) {
+		if (devc->stl->count == 0)
+			return FALSE; /* Need at least 1 sample to establish baseline */
+		expected_pattern = prev_bit ? mask : 0;
+	} else {
+		return FALSE;
+	}
+
+	mask64 = 0x0101010101010101ULL * mask;
+	expected64 = 0x0101010101010101ULL * expected_pattern;
+
+	n_words = raw_len / 8;
+	w = (const uint64_t *)raw_buf;
+	for (k = 0; k < n_words; k++) {
+		if ((w[k] & mask64) != expected64)
+			return FALSE;
+	}
+
+	for (i = n_words * 8; i < raw_len; i++) {
+		if ((raw_buf[i] & mask) != expected_pattern)
+			return FALSE;
+	}
+
+	return TRUE;
 }
 
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
@@ -102,12 +226,15 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	struct sr_dev_inst *sdi;
 	struct dev_context *devc;
 	uint8_t *ptr;
+	uint8_t *free_ptr;
 	uint8_t mask;
 	size_t len;
 	size_t step;
 	size_t expanded_len;
 	size_t bytes_to_transfer;
 	size_t i, j;
+	int trigger_offset;
+	int pre_trigger_samples;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -171,6 +298,83 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		devc->bytes_transferring = 0;
 
 	if (transfer->actual_length > 0) {
+		/*
+		 * Fast path: if the software trigger is armed, check whether the
+		 * trigger channel is completely static in this transfer and
+		 * cannot possibly match the trigger condition.  At 160 MHz,
+		 * unpacking and evaluating 430,080 samples per transfer in
+		 * soft_trigger_logic_check() takes ~4 ms, which exceeds the
+		 * 2.68 ms transfer arrival rate and causes pipeline starvation
+		 * and device stalls.  When the channel is idle, we can bypass
+		 * expansion and the trigger check in microseconds.
+		 */
+		if (devc->stl && !devc->trigger_fired &&
+		    trigger_cannot_match(devc, transfer->buffer,
+					 (size_t)transfer->actual_length)) {
+			step = (devc->cur_samplechannel > 0) ?
+				       (8 / devc->cur_samplechannel) :
+				       1;
+			expanded_len = (size_t)transfer->actual_length * step;
+			devc->stl->count += expanded_len;
+
+			/* Update prev_sample with the last sample of the transfer. */
+			uint8_t last_byte =
+				transfer->buffer[transfer->actual_length - 1];
+			uint8_t last_sample =
+				(last_byte >>
+				 ((step - 1) * devc->cur_samplechannel)) &
+				(0xff >> (8 - devc->cur_samplechannel));
+			*devc->stl->prev_sample = last_sample;
+
+			/* Maintain the circular pre-trigger buffer if enabled. */
+			if (devc->stl->pre_trigger_size > 0) {
+				size_t tail_samples = MIN(
+					expanded_len,
+					(size_t)devc->stl->pre_trigger_size);
+				if (step == 1) {
+					/* 8-channel mode: 1 sample per byte, zero-copy */
+					pre_trigger_append_local(
+						devc->stl,
+						transfer->buffer +
+							(transfer->actual_length -
+							 tail_samples),
+						(int)tail_samples);
+				} else {
+					/* Packed mode (2ch/4ch): expand into expand_buf */
+					size_t tail_raw =
+						(tail_samples + step - 1) / step;
+					size_t start_raw =
+						(size_t)transfer->actual_length -
+						tail_raw;
+					uint8_t *tail_buf =
+						devc->expand_buf ?
+							devc->expand_buf :
+							g_malloc(tail_raw * step);
+					mask = 0xff >> (8 - devc->cur_samplechannel);
+					for (i = 0; i < tail_raw; i++) {
+						for (j = 0; j < step; j++) {
+							tail_buf[i * step + j] =
+								mask &
+								(transfer->buffer
+									 [start_raw +
+									  i] >>
+								 (j *
+								  devc->cur_samplechannel));
+						}
+					}
+					pre_trigger_append_local(
+						devc->stl,
+						tail_buf + (tail_raw * step -
+							    tail_samples),
+						(int)tail_samples);
+					if (!devc->expand_buf)
+						g_free(tail_buf);
+				}
+			}
+			goto resubmit;
+		}
+
+		free_ptr = NULL;
 		ptr = transfer->buffer;
 		len = transfer->actual_length;
 
@@ -197,6 +401,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 				sr_warn("expand_buf too small or NULL, "
 					"falling back to g_malloc");
 				ptr = g_malloc(expanded_len);
+				free_ptr = ptr;
 				if (!ptr) {
 					sr_err("Failed to allocate expansion "
 					       "buffer");
@@ -218,13 +423,58 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			len = expanded_len;
 		}
 
-		submit_data(ptr, len, sdi);
+		/*
+		 * Software trigger handling.  Before the trigger fires, all
+		 * data is consumed by the soft-trigger logic, which keeps a
+		 * pre-trigger ring buffer and itself sends the pre-trigger
+		 * data plus SR_DF_TRIGGER once the pattern matches.  After it
+		 * fires, deliver the remaining data up to the sample budget.
+		 */
+		if (devc->stl) {
+			if (!devc->trigger_fired) {
+				trigger_offset = soft_trigger_logic_check(
+					devc->stl, ptr, (int)len,
+					&pre_trigger_samples);
+				if (trigger_offset >= 0) {
+					devc->samples_sent =
+						(uint64_t)pre_trigger_samples;
+					ptr += trigger_offset;
+					len -= (size_t)trigger_offset;
+					if (devc->samples_need > 0 &&
+					    len > devc->samples_need -
+							    devc->samples_sent)
+						len = devc->samples_need -
+						      devc->samples_sent;
+					if (len > 0) {
+						submit_data(ptr, len, sdi);
+						devc->samples_sent += len;
+					}
+					devc->trigger_fired = TRUE;
+				}
+			} else {
+				if (devc->samples_need > 0 &&
+				    len > devc->samples_need -
+						    devc->samples_sent)
+					len = devc->samples_need -
+					      devc->samples_sent;
+				if (len > 0) {
+					submit_data(ptr, len, sdi);
+					devc->samples_sent += len;
+				}
+			}
+		} else {
+			submit_data(ptr, len, sdi);
+		}
 
-		/* Free fallback allocation if we couldn't use expand_buf. */
-		if (devc->cur_samplechannel != 8 &&
-		    devc->cur_samplechannel > 0 && ptr != devc->expand_buf)
-			g_free(ptr);
+		if (free_ptr)
+			g_free(free_ptr);
 	}
+
+resubmit:
+	/* In triggered captures, stop once the sample budget is met. */
+	if (devc->stl && devc->trigger_fired && devc->samples_need > 0 &&
+	    devc->samples_sent >= devc->samples_need)
+		sipeed_slogic_combo8_acquisition_stop(sdi);
 
 	/* Determine how many bytes to request in the next submission. */
 	bytes_to_transfer = 0;
@@ -393,10 +643,31 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	usb_source_add(sdi->session, drvc->sr_ctx, 10, handle_events,
 		       (void *)sdi);
 
+	/* Compute the total number of samples to deliver this capture. */
+	devc->samples_need = devc->limit_samples;
+	if (devc->limit_msec > 0) {
+		devc->samples_need =
+			devc->limit_msec * devc->cur_samplerate / 1000;
+		sr_info("Capture limited to %" PRIu64 " samples "
+			"(%" PRIu64 " ms)",
+			devc->samples_need, devc->limit_msec);
+	}
+	devc->samples_sent = 0;
+
+	/*
+	 * Software trigger: while armed we can't predict when it will fire,
+	 * so the bulk pipeline runs continuously and the sample budget stops
+	 * it once the post-trigger data has been delivered.
+	 */
+	devc->stl = NULL;
+	devc->trigger_fired = TRUE;
+	if (sr_session_trigger_get(sdi->session))
+		devc->trigger_fired = FALSE;
+
 	/* Compute total bytes to transfer from the sample limit. */
-	if (devc->limit_samples > 0) {
+	if (devc->trigger_fired && devc->samples_need > 0) {
 		samples_in_bytes =
-			devc->limit_samples * devc->cur_samplechannel / 8;
+			devc->samples_need * devc->cur_samplechannel / 8;
 		devc->bytes_need_transfer =
 			samples_in_bytes / devc->transfers_buffer_size;
 		devc->bytes_need_transfer +=
@@ -478,6 +749,60 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	std_session_send_df_header(sdi);
 
 	/*
+	 * Report the actual samplerate through a META packet.  Frontends
+	 * (e.g. PulseView) use this to re-synchronise their channel layout
+	 * after the capture mode has changed, so this must be sent on every
+	 * acquisition, regardless of whether the rate changed.
+	 */
+	struct sr_datafeed_meta meta;
+	struct sr_config *src;
+	struct sr_datafeed_packet packet;
+
+	src = sr_config_new(SR_CONF_SAMPLERATE,
+			    g_variant_new_uint64(devc->cur_samplerate));
+	meta.config = g_slist_append(NULL, src);
+
+	packet.type = SR_DF_META;
+	packet.payload = &meta;
+	sr_session_send(sdi, &packet);
+
+	g_slist_free(meta.config);
+	sr_config_free(src);
+
+	/*
+	 * Set up the software trigger.  Done here, after the transfers are
+	 * already submitted but before CMD_START, so no receive callback can
+	 * race ahead of the trigger state.
+	 */
+	if (!devc->trigger_fired) {
+		struct sr_trigger *trigger;
+		int pre_trigger_samples;
+
+		uint64_t pts = 0;
+
+		trigger = sr_session_trigger_get(sdi->session);
+		if (devc->samples_need > 0) {
+			pts = (devc->capture_ratio * devc->samples_need) / 100;
+		} else {
+			/* Continuous mode: provide up to 100 ms of pre-trigger buffer */
+			pts = ((devc->cur_samplerate / 10) * devc->capture_ratio) / 100;
+		}
+		if (pts > MAX_PRE_TRIGGER_SAMPLES)
+			pts = MAX_PRE_TRIGGER_SAMPLES;
+		pre_trigger_samples = (int)pts;
+		devc->stl = soft_trigger_logic_new(sdi, trigger,
+						   pre_trigger_samples);
+		if (!devc->stl) {
+			sr_err("Failed to allocate software trigger logic");
+			sipeed_slogic_combo8_acquisition_stop(
+				(struct sr_dev_inst *)sdi);
+			return SR_ERR_MALLOC;
+		}
+		sr_info("Software trigger armed, %d pre-trigger samples",
+			pre_trigger_samples);
+	}
+
+	/*
 	 * Send the start command as a 4-byte control write: 16-bit sample
 	 * rate (little-endian), channel count, and one padding byte.  The
 	 * firmware expects a 4-byte-aligned payload; 500 ms is the timeout
@@ -495,6 +820,10 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	if (ret < 0) {
 		sr_err("Unable to send start command: %s",
 		       libusb_error_name(ret));
+		if (devc->stl) {
+			soft_trigger_logic_free(devc->stl);
+			devc->stl = NULL;
+		}
 		sipeed_slogic_combo8_acquisition_stop(
 			(struct sr_dev_inst *)sdi);
 		return SR_ERR_IO;
@@ -516,6 +845,10 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 			sr_err("Failed to allocate bit-expansion buffer "
 			       "(%zu bytes)",
 			       devc->expand_buf_size);
+			if (devc->stl) {
+				soft_trigger_logic_free(devc->stl);
+				devc->stl = NULL;
+			}
 			sipeed_slogic_combo8_acquisition_stop(
 				(struct sr_dev_inst *)sdi);
 			return SR_ERR_MALLOC;

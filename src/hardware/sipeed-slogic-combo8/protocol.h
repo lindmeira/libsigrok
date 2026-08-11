@@ -94,9 +94,29 @@ static const uint64_t samplerates[] = {
 	SR_MHZ(160),
 };
 
+/* Channel counts and the maximum samplerate each supports, index-aligned. */
+static const int32_t samplechannels[] = { 2, 4, 8 };
+static const uint64_t limit_samplerates[] = { SR_MHZ(160), SR_MHZ(80),
+					      SR_MHZ(40) };
+
+#define DEFAULT_SAMPLE_CHANNEL 8
+#define DEFAULT_SAMPLERATE SR_MHZ(40)
+
+/* Default pre-trigger ratio in percent; the SR_CONF_CAPTURE_RATIO config key
+ * overrides this at runtime. */
+#define DEFAULT_CAPTURE_RATIO 20
+
+/*
+ * Maximum pre-trigger ring buffer depth in samples (4 MSamples ~ 4 MB RAM)
+ * to prevent excessive memory allocation on very large sample limits.
+ */
+#define MAX_PRE_TRIGGER_SAMPLES (4 * 1024 * 1024)
+
 struct dev_context {
 	uint64_t limit_samples;
+	uint64_t limit_msec;
 	uint64_t cur_samplerate;
+	uint64_t limit_samplerate;
 	uint64_t cur_samplechannel;
 
 	struct libusb_transfer *transfers[NUM_CONCURRENT_TRANSFERS];
@@ -116,6 +136,23 @@ struct dev_context {
 	 * abort when too high. */
 	int empty_transfer_count;
 
+	/* Total samples to deliver this acquisition, derived from
+	 * limit_samples or limit_msec. */
+	uint64_t samples_need;
+	/* Samples already delivered to the session (used with triggers). */
+	uint64_t samples_sent;
+
+	/* Software trigger state. */
+	struct soft_trigger_logic *stl;
+	gboolean trigger_fired;
+	uint64_t capture_ratio;
+
+	/*
+	 * Guard against re-entrant config_channel_set() calls while
+	 * update_channel_enables() bulk-enables/disables channels.
+	 */
+	gboolean updating_channels;
+
 	/*
 	 * Pre-allocated buffer for expanding packed samples (2ch/4ch modes) to
 	 * one sample per byte.  Sized for transfers_buffer_size * max_step
@@ -126,20 +163,43 @@ struct dev_context {
 	size_t expand_buf_size;
 };
 
-/* Channel count derives automatically from samplerate. */
+/*
+ * Set the samplerate, clamping it down to the maximum the current channel
+ * count supports.  The channel count itself is left unchanged.
+ */
 static inline void devc_set_samplerate(struct dev_context *devc,
 				       uint64_t new_samplerate)
 {
-	devc->cur_samplerate = new_samplerate;
-	if (new_samplerate >= SR_MHZ(160)) {
-		devc->cur_samplechannel = 2;
-	} else if (new_samplerate >= SR_MHZ(80)) {
-		devc->cur_samplechannel = 4;
-	} else {
-		devc->cur_samplechannel = 8;
+	if (new_samplerate > devc->limit_samplerate) {
+		sr_warn("Samplerate clamped to %" PRIu64 "MHz: current setting "
+			"exceeds the device's %" PRIu64 "CH limit.",
+			devc->limit_samplerate / SR_MHZ(1),
+			devc->cur_samplechannel);
+		new_samplerate = devc->limit_samplerate;
 	}
-	sr_info("Rebind sample channel to %" PRIu64 "CH",
-		devc->cur_samplechannel);
+	devc->cur_samplerate = new_samplerate;
+}
+
+/*
+ * Set the active channel count and its samplerate limit.  Does not touch the
+ * samplerate itself: callers that raise the channel count beyond what the
+ * current rate supports must re-apply the rate with devc_set_samplerate()
+ * afterwards to clamp it down.
+ */
+static inline void devc_set_samplechannel(struct dev_context *devc,
+					  uint64_t new_samplechannel)
+{
+	size_t idx;
+
+	for (idx = 0; idx < ARRAY_SIZE(samplechannels); idx++) {
+		if ((uint64_t)samplechannels[idx] == new_samplechannel)
+			break;
+	}
+	if (idx >= ARRAY_SIZE(samplechannels))
+		return;
+
+	devc->cur_samplechannel = new_samplechannel;
+	devc->limit_samplerate = limit_samplerates[idx];
 }
 
 SR_PRIV int
@@ -182,23 +242,26 @@ static inline size_t get_number_of_transfers(struct dev_context *devc)
 }
 
 /*
- * Per-transfer timeout in milliseconds: time to fill one transfer buffer at
- * the current data rate, plus 25 % headroom.  Floor of 50 ms ensures a
- * reasonable timeout at very low samplerates.
+ * Transfer timeout in milliseconds: time to fill the entire in-flight queue
+ * (all concurrent transfers) at the current data rate, plus 25 % headroom.
+ * A floor of 1000 ms ensures tolerance for OS scheduling latency, frontend
+ * (PulseView) activity, and prevents premature USB transfer aborts.
  */
 static inline size_t get_timeout(struct dev_context *devc)
 {
 	size_t bytes_per_ms = to_bytes_per_ms(devc);
-	size_t buf_size = get_buffer_size(devc);
+	size_t total_size =
+		get_buffer_size(devc) * get_number_of_transfers(devc);
 	size_t timeout;
 
 	if (bytes_per_ms == 0)
 		bytes_per_ms = 1;
 
-	timeout = buf_size / bytes_per_ms; /* ms to fill one transfer */
-	timeout = timeout * 5 / 4; /* +25 % headroom          */
-	if (timeout < 50)
-		timeout = 50; /* floor: 50 ms            */
+	timeout = total_size /
+		  bytes_per_ms; /* ms to fill all in-flight transfers */
+	timeout = timeout * 5 / 4; /* +25 % headroom */
+	if (timeout < 1000)
+		timeout = 1000; /* floor: 1000 ms */
 	return timeout;
 }
 
