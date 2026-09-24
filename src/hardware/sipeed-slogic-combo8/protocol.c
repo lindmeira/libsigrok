@@ -102,6 +102,222 @@ static void finish_acquisition(struct sr_dev_inst *sdi)
 	}
 }
 
+static gboolean trigger_is_simple_2ch_match(struct dev_context *devc,
+		struct sr_trigger *trigger, struct sr_trigger_match **match_out)
+{
+	struct sr_trigger_stage *stage;
+	struct sr_trigger_match *match;
+	GSList *stages;
+	GSList *matches;
+
+	if (!match_out || devc->cur_samplechannel != 2 || !trigger)
+		return FALSE;
+
+	stages = trigger->stages;
+	if (!stages || stages->next)
+		return FALSE;
+
+	stage = stages->data;
+	if (!stage)
+		return FALSE;
+
+	matches = stage->matches;
+	if (!matches || matches->next)
+		return FALSE;
+
+	match = matches->data;
+	if (!match || !match->channel || !match->channel->enabled ||
+	    match->channel->type != SR_CHANNEL_LOGIC ||
+	    match->channel->index < 0 ||
+	    (uint64_t)match->channel->index >= devc->cur_samplechannel)
+		return FALSE;
+
+	switch (match->match) {
+	case SR_TRIGGER_ZERO:
+	case SR_TRIGGER_ONE:
+	case SR_TRIGGER_RISING:
+	case SR_TRIGGER_FALLING:
+	case SR_TRIGGER_EDGE:
+		*match_out = match;
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+static void simple_pre_trigger_append(struct soft_trigger_logic *stl,
+		const uint8_t *buf, size_t len)
+{
+	size_t size;
+
+	if (!stl || stl->pre_trigger_size <= 0 || len == 0)
+		return;
+
+	if (len > (size_t)stl->pre_trigger_size) {
+		buf += len - stl->pre_trigger_size;
+		len = stl->pre_trigger_size;
+	}
+
+	stl->pre_trigger_fill = MIN(stl->pre_trigger_fill + (int)len,
+				    stl->pre_trigger_size);
+
+	while (len > 0) {
+		size = MIN((size_t)(stl->pre_trigger_buffer +
+				    stl->pre_trigger_size -
+				    stl->pre_trigger_head),
+			   len);
+		memcpy(stl->pre_trigger_head, buf, size);
+		stl->pre_trigger_head += size;
+		if (stl->pre_trigger_head >=
+		    stl->pre_trigger_buffer + stl->pre_trigger_size)
+			stl->pre_trigger_head = stl->pre_trigger_buffer;
+		buf += size;
+		len -= size;
+	}
+}
+
+static void simple_pre_trigger_send(struct soft_trigger_logic *stl,
+		int *pre_trigger_samples)
+{
+	struct sr_datafeed_logic logic;
+	struct sr_datafeed_packet packet;
+	size_t size;
+
+	if (pre_trigger_samples)
+		*pre_trigger_samples = 0;
+
+	if (!stl || stl->pre_trigger_fill <= 0 || stl->pre_trigger_size <= 0)
+		return;
+
+	logic.unitsize = stl->unitsize;
+	packet.type = SR_DF_LOGIC;
+	packet.payload = &logic;
+
+	if (stl->pre_trigger_fill < stl->pre_trigger_size)
+		stl->pre_trigger_head = stl->pre_trigger_buffer;
+
+	while (stl->pre_trigger_fill > 0) {
+		size = MIN((size_t)(stl->pre_trigger_buffer +
+				    stl->pre_trigger_size -
+				    stl->pre_trigger_head),
+			   (size_t)stl->pre_trigger_fill);
+		logic.length = size;
+		logic.data = stl->pre_trigger_head;
+		sr_session_send(stl->sdi, &packet);
+		stl->pre_trigger_head = stl->pre_trigger_buffer;
+		stl->pre_trigger_fill -= size;
+		if (pre_trigger_samples)
+			*pre_trigger_samples += size / stl->unitsize;
+	}
+}
+
+static gboolean simple_trigger_logic_match(struct soft_trigger_logic *stl,
+		uint8_t sample, const struct sr_trigger_match *match)
+{
+	gboolean result;
+	int bit;
+	int prev_bit;
+
+	stl->count++;
+	result = FALSE;
+	bit = !!(sample & (1U << match->channel->index));
+
+	if (match->match == SR_TRIGGER_ZERO)
+		result = bit == 0;
+	else if (match->match == SR_TRIGGER_ONE)
+		result = bit != 0;
+	else {
+		if (stl->count == 1)
+			return FALSE;
+		prev_bit = !!(stl->prev_sample[0] &
+			     (1U << match->channel->index));
+		if (match->match == SR_TRIGGER_RISING)
+			result = prev_bit == 0 && bit != 0;
+		else if (match->match == SR_TRIGGER_FALLING)
+			result = prev_bit != 0 && bit == 0;
+		else if (match->match == SR_TRIGGER_EDGE)
+			result = prev_bit != bit;
+	}
+
+	return result;
+}
+
+static int receive_simple_2ch_trigger(struct dev_context *devc,
+		const uint8_t *packed, size_t packed_len, uint8_t **data,
+		size_t *len, int *pre_trigger_samples)
+{
+	struct soft_trigger_logic *stl;
+	struct sr_trigger_match *match;
+	uint8_t pre_trigger[4];
+	uint8_t sample;
+	size_t i, j;
+	size_t out_len;
+	gboolean matched;
+
+	if (data)
+		*data = NULL;
+	if (len)
+		*len = 0;
+	if (pre_trigger_samples)
+		*pre_trigger_samples = 0;
+
+	stl = devc->stl;
+	match = devc->simple_trigger_match;
+	if (!stl || !match || !data || !len)
+		return -1;
+
+	for (i = 0; i < packed_len; i++) {
+		for (j = 0; j < 4; j++) {
+			sample = (packed[i] >> (j * devc->cur_samplechannel)) &
+				 ((1U << devc->cur_samplechannel) - 1);
+			matched = simple_trigger_logic_match(stl, sample, match);
+			stl->prev_sample[0] = sample;
+			if (matched) {
+				simple_pre_trigger_append(stl, pre_trigger, j);
+				simple_pre_trigger_send(stl, pre_trigger_samples);
+				std_session_send_df_trigger(stl->sdi);
+
+				if (!devc->expand_buf ||
+				    devc->expand_buf_size <
+					    (packed_len - i) * 4) {
+					sr_err("Packed trigger buffer missing "
+					       "or too small");
+					return -1;
+				}
+
+				out_len = 0;
+				devc->expand_buf[out_len++] = sample;
+				for (j++; j < 4; j++) {
+					devc->expand_buf[out_len++] =
+						(packed[i] >>
+						 (j * devc->cur_samplechannel)) &
+						((1U << devc->cur_samplechannel) -
+						 1);
+				}
+				for (i++; i < packed_len; i++) {
+					for (j = 0; j < 4; j++) {
+						devc->expand_buf[out_len++] =
+							(packed[i] >>
+							 (j *
+							  devc->cur_samplechannel)) &
+							((1U <<
+							  devc->cur_samplechannel) -
+							 1);
+					}
+				}
+
+				*data = devc->expand_buf;
+				*len = out_len;
+				return 1;
+			}
+			pre_trigger[j] = sample;
+		}
+		simple_pre_trigger_append(stl, pre_trigger, ARRAY_SIZE(pre_trigger));
+	}
+
+	return 0;
+}
+
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 {
 	int ret;
@@ -117,6 +333,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	size_t i, j;
 	int trigger_offset;
 	int pre_trigger_samples;
+	int fast_trigger_state;
 
 	sdi = transfer->user_data;
 	devc = sdi->priv;
@@ -183,9 +400,35 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		free_ptr = NULL;
 		ptr = transfer->buffer;
 		len = transfer->actual_length;
+		fast_trigger_state = 0;
 
-		if (devc->cur_samplechannel != 8 &&
-		    devc->cur_samplechannel > 0) {
+		if (devc->stl && !devc->trigger_fired &&
+		    devc->simple_trigger_match) {
+			fast_trigger_state =
+				receive_simple_2ch_trigger(devc, transfer->buffer,
+							   len, &ptr, &len,
+							   &pre_trigger_samples);
+			if (fast_trigger_state < 0) {
+				free_transfer(transfer);
+				sipeed_slogic_combo8_acquisition_stop(sdi);
+				return;
+			}
+			if (fast_trigger_state > 0) {
+				devc->samples_sent =
+					(uint64_t)pre_trigger_samples;
+				if (devc->samples_need > 0 &&
+				    len > devc->samples_need -
+						  devc->samples_sent)
+					len = devc->samples_need -
+					      devc->samples_sent;
+				if (len > 0) {
+					submit_data(ptr, len, sdi);
+					devc->samples_sent += len;
+				}
+				devc->trigger_fired = TRUE;
+			}
+		} else if (devc->cur_samplechannel != 8 &&
+			   devc->cur_samplechannel > 0) {
 			/*
 			 * Packed mode: the firmware packs multiple samples per
 			 * byte.  Expand into the pre-allocated buffer (one
@@ -229,47 +472,55 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			len = expanded_len;
 		}
 
-		/*
-		 * Software trigger handling.  Before the trigger fires, all
-		 * data is consumed by the soft-trigger logic, which keeps a
-		 * pre-trigger ring buffer and itself sends the pre-trigger
-		 * data plus SR_DF_TRIGGER once the pattern matches.  After it
-		 * fires, deliver the remaining data up to the sample budget.
-		 */
-		if (devc->stl) {
-			if (!devc->trigger_fired) {
-				trigger_offset = soft_trigger_logic_check(
-					devc->stl, ptr, (int)len,
-					&pre_trigger_samples);
-				if (trigger_offset >= 0) {
-					devc->samples_sent =
-						(uint64_t)pre_trigger_samples;
-					ptr += trigger_offset;
-					len -= (size_t)trigger_offset;
+		if (fast_trigger_state <= 0 &&
+		    (!devc->stl || devc->trigger_fired ||
+		     !devc->simple_trigger_match)) {
+			/*
+			 * Software trigger handling.  Before the trigger fires,
+			 * all data is consumed by the soft-trigger logic, which
+			 * keeps a pre-trigger ring buffer and itself sends the
+			 * pre-trigger data plus SR_DF_TRIGGER once the pattern
+			 * matches.  After it fires, deliver the remaining data
+			 * up to the sample budget.
+			 */
+			if (devc->stl) {
+				if (!devc->trigger_fired) {
+					trigger_offset = soft_trigger_logic_check(
+						devc->stl, ptr, (int)len,
+						&pre_trigger_samples);
+					if (trigger_offset >= 0) {
+						devc->samples_sent =
+							(uint64_t)
+								pre_trigger_samples;
+						ptr += trigger_offset;
+						len -= (size_t)trigger_offset;
+						if (devc->samples_need > 0 &&
+						    len >
+							    devc->samples_need -
+								    devc->samples_sent)
+							len = devc->samples_need -
+							      devc->samples_sent;
+						if (len > 0) {
+							submit_data(ptr, len,
+								    sdi);
+							devc->samples_sent += len;
+						}
+						devc->trigger_fired = TRUE;
+					}
+				} else {
 					if (devc->samples_need > 0 &&
 					    len > devc->samples_need -
-							    devc->samples_sent)
+							  devc->samples_sent)
 						len = devc->samples_need -
 						      devc->samples_sent;
 					if (len > 0) {
 						submit_data(ptr, len, sdi);
 						devc->samples_sent += len;
 					}
-					devc->trigger_fired = TRUE;
 				}
 			} else {
-				if (devc->samples_need > 0 &&
-				    len > devc->samples_need -
-						    devc->samples_sent)
-					len = devc->samples_need -
-					      devc->samples_sent;
-				if (len > 0) {
-					submit_data(ptr, len, sdi);
-					devc->samples_sent += len;
-				}
+				submit_data(ptr, len, sdi);
 			}
-		} else {
-			submit_data(ptr, len, sdi);
 		}
 
 		if (free_ptr)
@@ -465,6 +716,7 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 	 * it once the post-trigger data has been delivered.
 	 */
 	devc->stl = NULL;
+	devc->simple_trigger_match = NULL;
 	devc->trigger_fired = TRUE;
 	if (sr_session_trigger_get(sdi->session))
 		devc->trigger_fired = FALSE;
@@ -597,6 +849,8 @@ sipeed_slogic_combo8_acquisition_start(const struct sr_dev_inst *sdi)
 				(struct sr_dev_inst *)sdi);
 			return SR_ERR_MALLOC;
 		}
+		trigger_is_simple_2ch_match(devc, trigger,
+					    &devc->simple_trigger_match);
 		sr_info("Software trigger armed, %d pre-trigger samples",
 			pre_trigger_samples);
 	}

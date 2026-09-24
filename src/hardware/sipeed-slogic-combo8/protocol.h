@@ -104,7 +104,7 @@ static const uint64_t limit_samplerates[] = { SR_MHZ(160), SR_MHZ(80),
 
 /* Default pre-trigger ratio in percent; the SR_CONF_CAPTURE_RATIO config key
  * overrides this at runtime. */
-#define DEFAULT_CAPTURE_RATIO 0
+#define DEFAULT_CAPTURE_RATIO 4
 
 struct dev_context {
 	uint64_t limit_samples;
@@ -138,6 +138,7 @@ struct dev_context {
 
 	/* Software trigger state. */
 	struct soft_trigger_logic *stl;
+	struct sr_trigger_match *simple_trigger_match;
 	gboolean trigger_fired;
 	uint64_t capture_ratio;
 
